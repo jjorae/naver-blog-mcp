@@ -78,6 +78,16 @@ IMAGE_COMPONENT = ["[data-a11y-title='사진']", ".se-component.se-image", ".se-
 # 반드시 해당 이미지 컴포넌트 안으로 스코프를 좁혀서 쓸 것.
 IMAGE_CAPTION = [".se-caption", "[class*='se-caption']"]
 
+# 대표 이미지("대표" 토글)  [실측 2026-09-18]
+# 검색 결과와 블로그 목록에 뜨는 섬네일을 정한다. 본문 이미지마다 버튼이 하나씩 붙고,
+# 지정된 것에만 se-is-selected 가 붙는다. 이미지를 하나도 안 넣었으면 DOM 에 없다.
+# 본문에 없는 파일은 대표로 지정할 수 없다 — 네이버는 본문 이미지 중에서만 고른다.
+# 그래서 표지를 쓰려면 본문 맨 앞에 넣고 그 버튼을 눌러야 한다.
+# 첫 이미지가 기본 대표라, 표지를 맨 앞에 넣으면 대개 이미 지정된 상태다.
+REP_IMAGE_BUTTON = ["button.se-set-rep-image-button", ".se-set-rep-image-button"]
+# 지정됨 표시 (클래스 이름)
+REP_IMAGE_SELECTED = "se-is-selected"
+
 # ---------------------------------------------------------------- 발행된 글 삭제
 # 글 페이지(#mainFrame)의 "삭제" 링크.  [실측]
 # 텍스트로 찾지 말 것 — 연관글 제목에 "삭제" 가 들어가면 그것도 잡힌다.
@@ -114,6 +124,17 @@ BODY_SIZE = "fs15"
 # ControlOrMeta+Shift+S 는 동작하지 않는다 (검증함). 선택 상태에서 이 버튼을 눌러야 한다.
 # 굵게/기울임/밑줄은 ControlOrMeta+B/I/U 단축키가 정상 동작한다.
 STRIKE_BUTTON = ["button[data-name='strikethrough']", "button.se-strikethrough-toolbar-button"]
+# 서식 초기화용 토글. 켜져 있으면 TOGGLE_ON_CLASS 가 붙는다(2026-09-16 실측).
+BOLD_BUTTON = ["button[data-name='bold']"]
+ITALIC_BUTTON = ["button[data-name='italic']"]
+UNDERLINE_BUTTON = ["button[data-name='underline']"]
+
+# 구분선 모양 고르기(2026-09-16 실측). 옆 화살표로 메뉴를 열고 data-value 로 고른다.
+# default=짧은 선, line1=긴 가는 선, line2=가운데 짧은 굵은 선, line3=가운데 V,
+# line4=가운데 마름모, line5=점선, line6=사선, line7=세로선. 붙여넣은 <hr> 은 line1 이 된다.
+DIVIDER_MENU = ["button[data-name='horizontal-line'].se-document-toolbar-select-option-button"]
+DIVIDER_OPTION = ["button.se-toolbar-option-icon-button[data-name='horizontal-line'][data-value='{value}']"]
+DIVIDER_COMPONENT = [".se-component.se-horizontalLine"]
 
 # ---------------------------------------------------------------- 코드블록
 # 툴바 버튼으로만 만들 수 있다.  [실측]
@@ -165,6 +186,21 @@ FILE_SOURCE_LOCAL = [
 FILE_POPUP_CLOSE = [".se-popup-file .se-popup-close-button", "button[data-log='lfile.close']"]
 # 업로드 완료 판정. 이미지와 마찬가지로 개수 증가로 봐야 한다.
 FILE_COMPONENT = ["[data-a11y-title='파일']", ".se-component.se-file"]
+
+# ---------------------------------------------------------------- 유튜브 영상
+# 툴바 '링크'(oglink) 버튼 -> 주소 입력 -> Enter(검색) -> 미리보기 -> 확인.  [실측 2026-09-17]
+# 유튜브 주소면 링크 카드가 아니라 영상 플레이어(se-oembed)가 들어가고, 그 뒤에 빈 본문
+# 컴포넌트가 생긴다. 본문에 주소를 치고 Enter 를 쳐도 플레이어가 생기지만 주소 글자가
+# 한 줄 그대로 남으므로 그 길은 쓰지 않는다.
+OGLINK_BUTTON = ["button.se-oglink-toolbar-button", "button[data-name='oglink']"]
+OGLINK_INPUT = ["input.se-popup-oglink-input"]
+OGLINK_SEARCH = ["button.se-popup-oglink-button"]
+OGLINK_PREVIEW = [".se-popup-oglink-preview"]
+OGLINK_CONFIRM = [".se-popup-button-confirm"]
+OGLINK_CLOSE = [".se-popup-close-button"]
+VIDEO_COMPONENT = [".se-component.se-oembed"]
+VIDEO_YOUTUBE = ".se-oembed-youtube"
+VIDEO_TITLE = ".se-oembed-youtube-title"
 
 # 발행 패널 열기  [실측]
 # button:has-text('발행') 은 쓰지 말 것 — 숨김 상태인 "예약 발행 0건" 이 먼저 잡힌다.
@@ -227,6 +263,15 @@ VISIBILITY = {
     "both_neighbor": ["#open_both_neighbor"],
     "private": ["#open_private"],
 }
+
+# 주제(블로그 홈 주제별 글보기 분류)  [실측 2026-09-16]
+# 발행 레이어 안 "주제" 줄의 링크를 누르면 "주제 설정" 층이 뜬다. 라디오 id 는 "이름_번호"
+# (예: 문학·책_5) 라 이름은 label 글자로 맞춘다. 층 아래 "이 카테고리의 글은 항상 이 주제로
+# 분류" 체크는 카테고리 설정을 바꾸므로 건드리지 않는다.
+TOPIC_OPEN = ["a[data-click-area='tpb*i.subject']", "a[aria-label='주제 목록 버튼']"]
+TOPIC_CURRENT = "a[data-click-area='tpb*i.subject'] span"
+TOPIC_RADIO = "input[data-click-area='tpb*i.subjectlist']"
+TOPIC_OK = ["button[data-click-area='tpb*i.subjectok']", "button[class*='ok_btn']"]
 
 # 태그 입력  [실측]
 # 주의: 카테고리와 마찬가지로 발행 레이어 안에만 존재한다.
@@ -346,3 +391,29 @@ async def first(scope, candidates: list[str], timeout: int = 3000, **fmt):
         if asyncio.get_event_loop().time() >= deadline:
             return None
         await asyncio.sleep(0.25)
+
+# ---------------------------------------------------------------- 글감(뉴스, 증권, 책)
+# 본문 아래 떠 있는 글감 바. 접혀 있으면 툴바 '글감' 버튼으로 편다(2026-09-16 실측).
+MATERIAL_BAR = [".se-floating-material-container"]
+MATERIAL_TOOLBAR = ["button[data-name='search'].se-document-toolbar-toggle-button"]
+MATERIAL_CATEGORY_TRIGGER = [".se-flayer-unified-category-dropdown-trigger"]
+MATERIAL_INPUT = [".se-floating-material-container input"]
+MATERIAL_ITEM = ["li.se-flayer-item"]
+MATERIAL_ITEM_TITLE = [".se-flayer-material-title"]
+MATERIAL_ITEM_DESC = [".se-flayer-material-detail-description"]
+# '문서에 추가' 는 hover 해야 보이는 div[role=button]. dispatch_event 로 누른다.
+MATERIAL_ADD = [".se-flayer-material-button"]
+MATERIAL_POPUP_CLOSE = [".se-popup-material-item-flayer [class*=close]"]
+MATERIAL_COMPONENT = [".se-component.se-material"]
+# 카드를 누르면 뜨는 모양 버튼. value = material_basic(기본형) | material_small(요약형)
+MATERIAL_LAYOUT = ["button.se-context-toolbar-group-toggle-button[data-name='material-layout'][data-value='{value}']",
+                   "button[data-name='material-layout'][data-value='{value}']"]
+
+# ---------------------------------------------------------------- 예약 발행 (발행 레이어 안, 2026-09-16 실측)
+# "발행 시간: 현재 | 예약". 예약을 누르면 날짜 칸(jQuery UI 달력)과 시, 분(10분 단위) 선택이 나온다.
+RESERVE_NOW = ["input[data-testid='nowTimeRadioBtn']", "#radio_time1"]
+RESERVE_PRE = ["input[data-testid='preTimeRadioBtn']", "#radio_time2"]
+RESERVE_DATE = ["input[class*='input_date']"]          # 값 형식 "2026. 09. 17"
+RESERVE_DAY = "td:not(.ui-state-disabled) button.ui-state-default"  # 달력 날짜 버튼
+RESERVE_HOUR = ["select[class*='hour_option']"]         # "00"~"23"
+RESERVE_MINUTE = ["select[class*='minute_option']"]     # "00","10",...,"50"

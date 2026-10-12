@@ -171,12 +171,23 @@ async def read_categories(page: Page, frame: Frame) -> list[tuple[str, bool]]:
     return [_clean_category(t) for t in await loc.all_inner_texts() if t.strip()]
 
 
+def split_category_path(name: str) -> str:
+    """"부모 > 자식" 으로 준 이름에서 실제로 고를 이름(마지막 칸)만 남긴다.
+
+    드롭다운 항목은 부모와 자식이 각각 한 줄이라 "종목 분석 > 국장" 같은
+    전체 경로로는 아무것도 못 고른다. 사람이 쓰는 표기를 그대로 받기 위해 여기서 자른다.
+    """
+    return name.split(">")[-1].strip() if ">" in name else name.strip()
+
+
 async def set_category(page: Page, frame: Frame, name: str) -> None:
     """카테고리를 고른다. 이름이 정확히 일치하는 항목을 우선한다.
 
     :has-text() 는 부분 매칭이라 "캠핑" 이 "캠핑하는 남자" 를 잡는다. 그래서
     정확 일치를 먼저 훑고, 없을 때만 부분 매칭으로 떨어진다.
+    "부모 > 자식" 표기로 줘도 된다. 마지막 칸으로 고른다.
     """
+    name = split_category_path(name)
     await _open_category_dropdown(page, frame)
     loc = await _category_items(frame)
     if loc is not None:
@@ -215,6 +226,51 @@ async def set_visibility(page: Page, frame: Frame, level: str) -> None:
         except Exception:
             continue
     raise EditorError(f"공개 설정 '{level}' 을 못 찾음 — selectors.VISIBILITY 갱신 필요")
+
+
+async def read_topic(frame: Frame) -> str | None:
+    """발행 레이어에 지금 보이는 주제 이름. 못 읽으면 None."""
+    try:
+        return (await frame.locator(S.TOPIC_CURRENT).first.inner_text(timeout=2000)).strip()
+    except Exception:
+        return None
+
+
+async def set_topic(page: Page, frame: Frame, name: str) -> str:
+    """발행 설정의 주제를 고른다(예: "비즈니스·경제"). 고른 뒤 화면에 보이는 주제를 돌려준다.
+
+    새 글쓰기 화면은 주제 칸에 블로그 기본 주제를 보여주지만, 불러온 임시저장 글 등에서는
+    선택이 빠진 채 발행된 적이 있다(2026-09-16 대표 확인). 그래서 매번 명시적으로 고른다.
+    """
+    await open_publish_panel(page, frame)
+    opener = await S.first(frame, S.TOPIC_OPEN)
+    if not opener:
+        raise EditorError("주제 버튼을 못 찾음 — selectors.TOPIC_OPEN 갱신 필요")
+    await opener.click()
+    await asyncio.sleep(0.8)
+    picked = await frame.evaluate(
+        """([sel, name]) => {
+            for (const input of document.querySelectorAll(sel)) {
+                const label = document.querySelector(`label[for="${CSS.escape(input.id)}"]`);
+                if (label && label.textContent.trim() === name) { input.click(); return true; }
+            }
+            return false;
+        }""",
+        [S.TOPIC_RADIO, name],
+    )
+    if not picked:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+        raise EditorError(f"주제 '{name}' 을 목록에서 못 찾음")
+    ok = await S.first(frame, S.TOPIC_OK)
+    if not ok:
+        raise EditorError("주제 확인 버튼을 못 찾음 — selectors.TOPIC_OK 갱신 필요")
+    await ok.click()
+    await asyncio.sleep(0.8)
+    now = await read_topic(frame)
+    if now != name:
+        raise EditorError(f"주제를 '{name}' 로 골랐는데 화면에는 '{now}'")
+    return now
 
 
 async def set_tags(page: Page, frame: Frame, tags: list[str]) -> int:
@@ -270,7 +326,14 @@ async def close_draft_list(page: Page, frame: Frame) -> None:
 async def list_drafts(page: Page, frame: Frame) -> list[tuple[str, str]]:
     """[(제목, 저장일시), ...]. 최신순으로 나온다."""
     await open_draft_list(page, frame)
-    items = await _locate_all(frame, S.DRAFT_ITEM)
+    # 삭제 직후에는 목록이 다시 그려지는 동안 잠깐 비어 보인다. 바로 [] 를 돌려주면
+    # 연달아 지울 때 "임시저장된 글이 없습니다" 로 멈춘다. 개수 표시가 0 이 아니면 기다린다.
+    items = None
+    for _ in range(16):
+        items = await _locate_all(frame, S.DRAFT_ITEM)
+        if items is not None or await draft_count(frame) == 0:
+            break
+        await asyncio.sleep(0.25)
     if items is None:
         return []
     out = []
@@ -295,15 +358,25 @@ async def _inner(scope, candidates: list[str]) -> str:
         return ""
 
 
-def pick_draft(drafts: list[tuple[str, str]], title: str = "") -> int:
-    """발행할 글의 인덱스를 고른다. 브라우저 없이 검증할 수 있게 순수 함수로 뒀다.
+def pick_draft(drafts: list[tuple[str, str]], title: str = "", index: int | None = None) -> int:
+    """발행하거나 삭제할 글의 인덱스를 고른다. 브라우저 없이 검증할 수 있게 순수 함수로 뒀다.
 
-    발행은 되돌리기 어렵다. 조금이라도 애매하면 고르지 않고 예외를 던진다:
+    발행과 삭제는 되돌리기 어렵다. 조금이라도 애매하면 고르지 않고 예외를 던진다:
     제목이 여러 글과 맞거나, 제목 없이 호출됐는데 임시저장이 2건 이상이면 거부.
+
+    index 는 목록 순번(1 이 최신)이다. 같은 제목으로 여러 번 임시저장했을 때 쓴다.
+    title 을 같이 주면 그 순번의 제목이 맞는지 확인하고, 다르면 거부한다.
     """
     if not drafts:
         raise EditorError("임시저장된 글이 없습니다")
-    listing = "\n".join(f"  - {t} ({d})" for t, d in drafts)
+    listing = "\n".join(f"  {i}. {t} ({d})" for i, (t, d) in enumerate(drafts, 1))
+
+    if index is not None:
+        if not 1 <= index <= len(drafts):
+            raise EditorError(f"순번 {index} 는 범위 밖입니다(1~{len(drafts)}):\n{listing}")
+        if title and title not in drafts[index - 1][0]:
+            raise EditorError(f"순번 {index} 의 제목이 '{title}' 과 다릅니다: {drafts[index - 1][0]}")
+        return index - 1
 
     if not title:
         if len(drafts) > 1:
@@ -415,7 +488,7 @@ async def delete_post(page: Page, blog_id: str, url_or_log_no: str) -> str:
     return url
 
 
-async def delete_draft(page: Page, frame: Frame, title: str = "") -> str:
+async def delete_draft(page: Page, frame: Frame, title: str = "", index: int | None = None) -> str:
     """임시저장 글을 삭제한다. 삭제된 글의 제목을 반환. 복구되지 않는다.
 
     확인이 **네이티브 dialog** 로 뜬다 ("삭제된 글은 복구되지 않습니다").
@@ -425,7 +498,7 @@ async def delete_draft(page: Page, frame: Frame, title: str = "") -> str:
     대상 선택은 publish 와 같은 pick_draft 안전장치를 쓴다 (애매하면 거부).
     """
     drafts = await list_drafts(page, frame)
-    idx = pick_draft(drafts, title)
+    idx = pick_draft(drafts, title, index)
     target = drafts[idx][0]
 
     edit = await S.first(frame, S.DRAFT_EDIT_MODE, timeout=5000)
@@ -455,6 +528,65 @@ async def delete_draft(page: Page, frame: Frame, title: str = "") -> str:
 
     _assert_delete_confirmed(seen, target)
     return target
+
+
+async def reserve_state(frame: Frame) -> dict:
+    """발행 레이어의 발행 시간 상태. {pre, date, hour, minute}"""
+    return await frame.evaluate(
+        """([pre, date, hour, minute]) => ({
+          pre: !!(document.querySelector(pre) || {}).checked,
+          date: (document.querySelector(date) || {}).value || "",
+          hour: (document.querySelector(hour) || {}).value || "",
+          minute: (document.querySelector(minute) || {}).value || "" })""",
+        [S.RESERVE_PRE[0], S.RESERVE_DATE[0], S.RESERVE_HOUR[0], S.RESERVE_MINUTE[0]])
+
+
+async def set_reservation(page: Page, frame: Frame, when) -> dict:
+    """발행 레이어에서 예약 발행 시각을 맞추고, 화면 값이 정확히 그 시각인지 확인해 돌려준다.
+
+    when: datetime (한국 시간). 분은 10분 단위만 된다. 이번 달 날짜만 지원한다(달 넘기기 없음).
+    값이 하나라도 다르면 EditorError. 이 함수는 발행 버튼을 누르지 않는다.
+    """
+    if when.minute % 10:
+        raise EditorError(f"예약 분은 10분 단위만 됩니다: {when:%H:%M}")
+    await open_publish_panel(page, frame)
+    pre = frame.locator(S.RESERVE_PRE[0])
+    if not await pre.count():
+        raise EditorError("예약 라디오를 못 찾음 — selectors.RESERVE_PRE 갱신 필요")
+    await pre.first.evaluate("e => e.click()")
+    await asyncio.sleep(0.8)
+
+    want_date = f"{when:%Y. %m. %d}"
+    state = await reserve_state(frame)
+    if state["date"] != want_date:
+        if state["date"][:9] != want_date[:9]:
+            raise EditorError(f"다른 달 예약은 지원하지 않음: 지금 {state['date']}, 원하는 {want_date}")
+        await frame.locator(S.RESERVE_DATE[0]).first.click()
+        await asyncio.sleep(0.8)
+        days = frame.locator(S.RESERVE_DAY)
+        for i in range(await days.count()):
+            if (await days.nth(i).inner_text()).strip() == str(when.day):
+                await days.nth(i).click()
+                break
+        else:
+            raise EditorError(f"달력에서 {when.day}일을 못 찾음(지난 날짜일 수 있음)")
+        await asyncio.sleep(0.6)
+    await frame.locator(S.RESERVE_HOUR[0]).first.select_option(f"{when.hour:02d}")
+    await frame.locator(S.RESERVE_MINUTE[0]).first.select_option(f"{when.minute:02d}")
+    await asyncio.sleep(0.6)
+
+    state = await reserve_state(frame)
+    want = {"pre": True, "date": want_date, "hour": f"{when.hour:02d}", "minute": f"{when.minute:02d}"}
+    if state != want:
+        raise EditorError(f"예약 시각이 화면에 제대로 안 들어감: 화면 {state}, 원하는 {want}")
+    return state
+
+
+async def reserved_count(frame: Frame) -> int | None:
+    """상단의 '예약 발행 N건' 숫자. 화면에 숨어 있어도 글자는 DOM 에 있다."""
+    text = await frame.evaluate("() => document.body.textContent")
+    m = re.search(r"예약\s*발행\s*(\d+)\s*건", text or "")
+    return int(m.group(1)) if m else None
 
 
 async def title_is_empty(frame: Frame) -> bool:
@@ -505,11 +637,28 @@ async def _fresh_line(page: Page, frame: Frame) -> None:
     """새 줄에서 시작하게 만든다.
 
     목록의 "- " 자동 변환은 줄 맨 앞에서만 걸린다. 기존 문단 끝에 이어 치면
-    그냥 "- " 문자로 남는다. 문서가 비어 있으면 Enter 를 치지 않는다.
+    그냥 "- " 문자로 남는다. 커서가 선 줄이 이미 비어 있으면 Enter 를 치지 않는다.
+    문서 전체 길이로 보면 영상·글감 카드 뒤 빈 줄에서도 Enter 를 쳐서 빈 줄이 하나 더
+    생긴다(2026-09-17 실측). 커서 줄을 못 읽으면 예전처럼 문서 길이로 본다.
     """
-    if await _body_len(frame) > 0:
+    try:
+        empty = await frame.evaluate(_CARET_LINE_EMPTY_JS)
+    except Exception:
+        empty = None
+    if empty is None:
+        empty = await _body_len(frame) <= 0
+    if not empty:
         await page.keyboard.press("Enter")
         await asyncio.sleep(0.25)
+
+
+_CARET_LINE_EMPTY_JS = """
+() => {
+  const n = window.getSelection().anchorNode;
+  const p = n && (n.nodeType === 1 ? n : n.parentElement).closest('.se-text-paragraph');
+  return p ? p.innerText.split(String.fromCharCode(8203)).join('').trim() === '' : null;
+}
+"""
 
 
 async def paste_html(page: Page, frame: Frame, html: str, plain: str) -> None:
@@ -519,8 +668,20 @@ async def paste_html(page: Page, frame: Frame, html: str, plain: str) -> None:
     다시 클릭하면 커서가 클릭 지점(글 중간)에 놓여 내용이 뒤섞인다.
 
     권한: context 생성 시 clipboard-read/write 를 grant 해야 한다 (session.py 참조).
+
+    창이 뒤에 있으면 navigator.clipboard.write 가 거부도 아니고 그냥 안 끝난다.
+    사람이 다른 창을 쓰는 동안 돌리면 여기서 영원히 멈춘다(2026-09-16 실측: 제목만
+    써진 채 17분 정지). 그래서 창을 앞으로 끌어오고, 그래도 안 끝나면 끊어서
+    호출부가 타이핑 경로로 넘어가게 한다.
     """
-    await page.evaluate(_CLIPBOARD_JS, [html, plain])
+    try:
+        await page.bring_to_front()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(page.evaluate(_CLIPBOARD_JS, [html, plain]), timeout=5)
+    except asyncio.TimeoutError as e:
+        raise EditorError("클립보드 쓰기 5초 초과 — 창이 뒤에 있거나 권한 문제") from e
     await page.keyboard.press("ControlOrMeta+V")
     await asyncio.sleep(0.6)
 
@@ -556,6 +717,28 @@ async def _clear_toggle(frame: Frame, candidates: list[str]) -> None:
         await asyncio.sleep(0.25)
 
 
+async def reset_style(page: Page, frame: Frame) -> None:
+    """다음에 쓸 글의 서식을 보통으로 되돌린다.
+
+    에디터는 마지막으로 쓴 서식을 기억했다가, 뒤에 붙여넣거나 타이핑하는 글에 그대로
+    입힌다. 제목 뒤 모든 문단이 큰 글씨·굵게가 되고, 기울임 한 줄 뒤로 전부 기울임이
+    됐다(2026-09-16 실측). 인라인 스타일로 "보통"을 명시해도 굵게는 안 풀렸고,
+    툴바 토글을 끄고 글자 크기를 본문으로 되돌리는 것만 확실히 먹혔다.
+    """
+    for cands in (S.BOLD_BUTTON, S.ITALIC_BUTTON, S.UNDERLINE_BUTTON, S.STRIKE_BUTTON):
+        try:
+            await _clear_toggle(frame, cands)
+        except Exception:
+            pass
+    try:
+        fs = await S.first(frame, S.FONT_SIZE_BUTTON, timeout=1500)
+        label = (await fs.inner_text()).strip() if fs else ""
+        if S.BODY_SIZE.replace("fs", "") not in label:
+            await set_font_size(page, frame, S.BODY_SIZE)
+    except Exception:
+        pass
+
+
 async def apply_link(page: Page, frame: Frame, url: str) -> None:
     """선택된 텍스트에 링크를 건다.
 
@@ -571,6 +754,15 @@ async def apply_link(page: Page, frame: Frame, url: str) -> None:
     await inp.fill(url)
     await _click_toolbar(frame, S.LINK_APPLY, "링크 적용")
     await asyncio.sleep(0.4)
+    # 링크 입력 층이 닫힐 때까지 기다린다. 열린 채로 다음 줄을 치면 방금 건 링크 글자와
+    # 뒤 링크 줄이 통째로 사라졌다(2026-09-16 실측: 글 끝 링크 3개 중 3개 누락).
+    for _ in range(20):
+        if not await _any_visible(frame, S.LINK_INPUT):
+            break
+        await asyncio.sleep(0.15)
+    else:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.4)
 
 
 async def set_font_size(page: Page, frame: Frame, value: str) -> None:
@@ -631,6 +823,9 @@ async def type_spans(page: Page, frame: Frame, spans: list[Span]) -> None:
         if s.href:
             await apply_link(page, frame, s.href)
         await page.keyboard.press("ArrowRight")  # 선택 해제하고 커서를 끝으로
+        if s.href:
+            await page.keyboard.press("End")
+            await asyncio.sleep(0.3)
         if s.strike:
             await _clear_toggle(frame, S.STRIKE_BUTTON)
 
@@ -674,7 +869,16 @@ async def insert_image(page: Page, frame: Frame, path: str, caption: str = "") -
     # 캡션은 평소 0x0 으로 숨어 있다. 이미지 컴포넌트를 클릭해야 노출되고,
     # 노출된 뒤 캡션을 한 번 더 클릭해야 포커스가 들어간다. (2026-08-25 실측)
     # 컴포넌트만 클릭하고 타이핑하면 입력이 아무 데도 안 들어간다.
-    comps = await _locate_all(frame, S.IMAGE_COMPONENT)
+    # 업로드 직후 컴포넌트 목록을 잠깐 못 읽는 때가 있었다(2026-09-16, 2.4MB GIF 뒤 None 으로 전체가 죽음).
+    # 몇 번 다시 읽고, 끝내 못 읽으면 캡션만 실패로 돌린다.
+    comps = None
+    for _ in range(10):
+        comps = await _locate_all(frame, S.IMAGE_COMPONENT)
+        if comps is not None and await comps.count() > before:
+            break
+        await asyncio.sleep(0.5)
+    else:
+        return False
     comp = comps.nth(before)  # 방금 붙은 것
     try:
         await comp.click()
@@ -695,6 +899,54 @@ async def insert_image(page: Page, frame: Frame, path: str, caption: str = "") -
 async def _image_count(frame: Frame) -> int:
     loc = await _locate_all(frame, S.IMAGE_COMPONENT)
     return await loc.count() if loc is not None else 0
+
+
+async def set_rep_image(page: Page, frame: Frame, index: int = 0) -> bool:
+    """index 번째 본문 이미지를 대표 이미지로 지정한다. 지정됐으면 True.
+
+    대표 이미지는 검색 결과와 블로그 목록의 섬네일이다. 네이버는 **본문에 들어간
+    이미지 중에서만** 고르게 한다 — 따로 올리는 칸이 없다. 그래서 표지 파일을
+    쓰려면 본문에 넣은 뒤 그 이미지의 "대표" 버튼을 눌러야 한다. (2026-09-18 실측)
+
+    첫 이미지가 기본 대표라서 index=0 이면 대개 이미 눌려 있다. 그때는 누르지 않고
+    True 를 돌려준다. 이미 지정된 것을 다시 누르면 해제되기 때문이다.
+    """
+    btns = await _locate_all(frame, S.REP_IMAGE_BUTTON)
+    if btns is None:
+        return False
+    n = await btns.count()
+    if n <= index:
+        return False
+    btn = btns.nth(index)
+
+    async def selected() -> bool:
+        cls = await btn.get_attribute("class") or ""
+        return S.REP_IMAGE_SELECTED in cls
+
+    if await selected():
+        return True
+    try:
+        await btn.scroll_into_view_if_needed(timeout=5000)
+        await btn.click()
+    except Exception:
+        return False
+    for _ in range(10):
+        await asyncio.sleep(0.3)
+        if await selected():
+            return True
+    return False
+
+
+async def rep_image_index(frame: Frame) -> int | None:
+    """지금 대표로 지정된 이미지가 몇 번째인지. 없으면 None."""
+    btns = await _locate_all(frame, S.REP_IMAGE_BUTTON)
+    if btns is None:
+        return None
+    for i in range(await btns.count()):
+        cls = await btns.nth(i).get_attribute("class") or ""
+        if S.REP_IMAGE_SELECTED in cls:
+            return i
+    return None
 
 
 async def insert_file(page: Page, frame: Frame, path: str) -> None:
@@ -736,6 +988,21 @@ async def insert_file(page: Page, frame: Frame, path: str) -> None:
 async def _file_count(frame: Frame) -> int:
     loc = await _locate_all(frame, S.FILE_COMPONENT)
     return await loc.count() if loc is not None else 0
+
+
+async def insert_divider(page: Page, frame: Frame, style: str) -> None:
+    """모양을 골라 구분선을 넣는다. 붙여넣은 <hr> 은 기본 모양(긴 가는 선)으로만 들어간다."""
+    before = await _count(frame, S.DIVIDER_COMPONENT)
+    opener = await S.first(frame, S.DIVIDER_MENU, timeout=4000)
+    if not opener:
+        raise EditorError("구분선 메뉴를 못 찾음 — selectors.DIVIDER_MENU 갱신 필요")
+    await opener.click()
+    await asyncio.sleep(0.4)
+    opt = await S.first(frame, S.DIVIDER_OPTION, timeout=4000, value=style)
+    if not opt:
+        raise EditorError(f"구분선 모양 {style} 을 못 찾음 — selectors.DIVIDER_OPTION 확인")
+    await opt.click()
+    await _wait_added(frame, S.DIVIDER_COMPONENT, before, "구분선")
 
 
 async def insert_code_block(page: Page, frame: Frame, code: str) -> None:
@@ -871,6 +1138,167 @@ async def insert_place(page: Page, frame: Frame, query: str) -> str:
     return picked
 
 
+async def _material_open_bar(page: Page, frame: Frame) -> None:
+    if await S.first(frame, S.MATERIAL_BAR, timeout=1500):
+        return
+    btn = await S.first(frame, S.MATERIAL_TOOLBAR)
+    if not btn:
+        raise EditorError("글감 버튼을 못 찾음 — selectors.MATERIAL_TOOLBAR 갱신 필요")
+    await btn.click()
+    if not await S.first(frame, S.MATERIAL_BAR, timeout=5000):
+        raise EditorError("글감 바가 안 열림 — selectors.MATERIAL_BAR 갱신 필요")
+
+
+async def _material_results(frame: Frame, seconds: int = 8) -> list[tuple[str, str]]:
+    """보이는 검색 결과 [(제목, 설명)]. DOM 순서 그대로(숨김 항목 제외)."""
+    for _ in range(seconds * 2):
+        await asyncio.sleep(0.5)
+        rows = await frame.evaluate(
+            """([item, title, desc]) => [...document.querySelectorAll(item)]
+                 .filter(e => e.offsetParent !== null)
+                 .map(e => [(e.querySelector(title) || {}).innerText || '',
+                            (e.querySelector(desc) || {}).innerText || ''])""",
+            [S.MATERIAL_ITEM[0], S.MATERIAL_ITEM_TITLE[0], S.MATERIAL_ITEM_DESC[0]])
+        if rows:
+            return [(t.strip(), d.replace(chr(10), " ").strip()) for t, d in rows]
+    return []
+
+
+async def _material_close_popup(page: Page, frame: Frame) -> None:
+    close = await S.first(frame, S.MATERIAL_POPUP_CLOSE, timeout=1500)
+    if close:
+        await close.click()
+    else:
+        await page.keyboard.press("Escape")
+    await asyncio.sleep(0.5)
+
+
+async def _material_search(page: Page, frame: Frame, kind: str, arg: str) -> tuple[list[tuple[str, str]], int] | None:
+    """분류를 고르고 검색어 후보로 찾는다. 맞는 결과가 있으면 (결과, 순번), 결과 팝업은 열린 채로 둔다."""
+    from .material import CATEGORY, best_match, queries
+
+    await _material_open_bar(page, frame)
+    trigger = await S.first(frame, S.MATERIAL_CATEGORY_TRIGGER)
+    if not trigger:
+        raise EditorError("글감 분류 버튼을 못 찾음 — selectors.MATERIAL_CATEGORY_TRIGGER 갱신 필요")
+    await trigger.click()
+    await asyncio.sleep(0.6)
+    label = CATEGORY[kind]
+    await frame.locator("li, button").filter(has_text=re.compile(rf"^\s*{label}\s*$")).last.click()
+    await asyncio.sleep(0.5)
+
+    for query in queries(kind, arg):
+        inp = await S.first(frame, S.MATERIAL_INPUT)
+        if not inp:
+            raise EditorError("글감 검색창을 못 찾음 — selectors.MATERIAL_INPUT 갱신 필요")
+        await inp.click()
+        await inp.fill(query)
+        await page.keyboard.press("Enter")
+        rows = await _material_results(frame)
+        idx = best_match(kind, arg, rows)
+        if idx is not None:
+            return rows, idx
+    return None
+
+
+MATERIAL_KINDS = ("news", "stock", "book")
+
+
+async def resolve_materials(page: Page, frame: Frame, blocks: list[Block], notes: list[str]) -> list[Block]:
+    """본문을 쓰기 전에 글감 카드를 미리 찾아본다. 못 찾은 카드는 글자 문단으로 바꾼다.
+
+    쓰는 도중에 검색이 실패하면 커서가 검색창으로 갔다가 돌아오지 못해, 대신 적은 글자가
+    앞 줄 위에 끼어든다(2026-09-16 실측). 그래서 실패는 쓰기 전에 걸러낸다.
+    """
+    from .material import fallback_text
+
+    out: list[Block] = []
+    for b in blocks:
+        if b.type not in MATERIAL_KINDS:
+            out.append(b)
+            continue
+        try:
+            found = await _material_search(page, frame, b.type, b.raw)
+        except (EditorError, ValueError) as e:
+            found = None
+            notes.append(f"글감 {b.type} 검색 오류({e})")
+        if found:
+            out.append(b)
+        else:
+            notes.append(f"글감 {b.type} 못 찾음→글자({b.raw[:30]})")
+            out.append(Block("paragraph", spans=[Span(fallback_text(b.type, b.raw))], gap=b.gap))
+    if any(b.type in MATERIAL_KINDS for b in blocks):
+        await _material_close_popup(page, frame)
+    return out
+
+
+async def insert_material(page: Page, frame: Frame, kind: str, arg: str) -> str | None:
+    """글감 카드(뉴스, 증권, 책)를 넣는다. 고른 '제목 / 설명' 을 반환, 맞는 결과가 없으면 None.
+
+    엉뚱한 카드를 넣지 않는 게 우선이다. 매칭 기준은 material.best_match.
+    """
+    from .material import split_layout
+
+    before = await _count(frame, S.MATERIAL_COMPONENT)
+    found = await _material_search(page, frame, kind, arg)
+    if not found:
+        await _material_close_popup(page, frame)
+        return None
+    rows, idx = found
+    item = frame.locator(f"{S.MATERIAL_ITEM[0]}:visible").nth(idx)
+    await item.locator(S.MATERIAL_ADD[0]).dispatch_event("click")
+    await _wait_added(frame, S.MATERIAL_COMPONENT, before, "글감 카드")
+    await _material_close_popup(page, frame)
+
+    _, layout = split_layout(arg)
+    card = frame.locator(S.MATERIAL_COMPONENT[0]).nth(before)
+    if layout not in (await card.get_attribute("class") or ""):
+        await card.click()
+        await asyncio.sleep(0.6)
+        btn = await S.first(frame, S.MATERIAL_LAYOUT, value=layout)
+        if btn:
+            await btn.click()
+            await asyncio.sleep(0.8)
+    return " / ".join(rows[idx])
+
+
+async def insert_video(page: Page, frame: Frame, url: str) -> str:
+    """유튜브 영상 플레이어를 넣는다. 들어간 영상 제목을 반환.
+
+    툴바 '링크' 버튼으로 넣는다(selectors.OGLINK_* 참조). 미리보기가 안 뜨거나 플레이어가
+    아닌 링크 카드가 들어가면 EditorError. 실패해도 글자를 대신 치지 않는다 — 팝업에서
+    커서가 돌아오지 못해 엉뚱한 줄에 끼어든다(글감 카드와 같은 함정).
+    """
+    from .ir import YOUTUBE_URL
+
+    if not YOUTUBE_URL.match(url):
+        raise EditorError(f"유튜브 영상 주소가 아님: {url}")
+    btn = await S.first(frame, S.OGLINK_BUTTON)
+    if not btn:
+        raise EditorError("링크 버튼을 못 찾음 — selectors.OGLINK_BUTTON 갱신 필요")
+    before = await _count(frame, S.VIDEO_COMPONENT)
+    await btn.click()
+    inp = await S.first(frame, S.OGLINK_INPUT, timeout=5000)
+    if not inp:
+        raise EditorError("링크 주소 입력창을 못 찾음 — selectors.OGLINK_INPUT 갱신 필요")
+    await inp.click()
+    await inp.press_sequentially(url, delay=5)
+    await page.keyboard.press("Enter")
+    preview = await S.first(frame, S.OGLINK_PREVIEW, timeout=10_000)
+    confirm = await S.first(frame, S.OGLINK_CONFIRM, timeout=2000) if preview else None
+    if not confirm:
+        close = await S.first(frame, S.OGLINK_CLOSE, timeout=1500)
+        if close:
+            await close.click()
+        raise EditorError(f"영상 미리보기가 안 뜸(비공개·삭제된 영상일 수 있음): {url}")
+    await confirm.click()
+    await _wait_added(frame, S.VIDEO_COMPONENT, before, "영상")
+    player = frame.locator(S.VIDEO_COMPONENT[0]).nth(before)
+    if not await player.locator(S.VIDEO_YOUTUBE).count():
+        raise EditorError(f"영상 플레이어가 아닌 것이 들어감: {url}")
+    return (await player.locator(S.VIDEO_TITLE).first.inner_text()).strip()
+
+
 # ------------------------------------------------------------ 본문 조립
 
 async def write_post(
@@ -879,9 +1307,20 @@ async def write_post(
     markdown: str,
     *,
     prefer_paste: bool = True,
+    cover: str | None = None,
 ) -> list[str]:
+    """cover 를 주면 본문 맨 앞에 그 그림을 넣는다(대표 이미지용).
+
+    네이버는 본문 이미지 중에서만 대표를 고를 수 있어서, 표지를 섬네일로 쓰려면
+    본문에 들어가 있어야 한다. 맨 앞에 넣으면 첫 이미지가 되어 기본 대표가 된다.
+    지정 자체는 호출부가 set_rep_image 로 한 번 더 확인한다.
+    캡션은 넣지 않는다 — 표지에는 글자가 이미 그려져 있어서 아래에 한 줄 더 붙으면
+    제목이 두 번 나온다.
+    """
     frame = await get_editor_frame(page)
     await dismiss_popups(frame)
+    notes: list[str] = []
+    blocks = await resolve_materials(page, frame, parse_markdown(markdown), notes)
 
     title_loc = await S.first(frame, S.TITLE)
     if not title_loc:
@@ -894,8 +1333,15 @@ async def write_post(
         raise EditorError("본문 영역을 못 찾음 — selectors.BODY 갱신 필요")
     await body_loc.click()  # 최초 1회만 클릭. 이후에는 커서를 그대로 이어 쓴다.
 
-    blocks = parse_markdown(markdown)
-    notes: list[str] = []
+    if cover:
+        # 표지가 안 올라가도 글 전체를 날리지는 않는다. 기록만 남기고 본문을 계속 쓴다.
+        try:
+            await insert_image(page, frame, cover, "")
+            notes.append("0:표지")
+        except EditorError as e:
+            notes.append(f"0:표지 넣기 실패({e})")
+        await _focus_tail(page, frame)
+
     for i, seg in enumerate(segment(blocks), 1):
         if seg.kind in ("image", "file"):
             if seg.kind == "image":
@@ -918,17 +1364,42 @@ async def write_post(
                     await insert_formula(page, frame, b.raw)
                     await _focus_tail(page, frame)
                     notes.append(f"{i}:수식")
+                elif b.type == "divider":
+                    from .ir import DIVIDER_STYLE
+                    await insert_divider(page, frame, DIVIDER_STYLE or "line1")
+                    await _focus_tail(page, frame)
+                    notes.append(f"{i}:구분선({DIVIDER_STYLE})")
+                elif b.type in MATERIAL_KINDS:
+                    try:
+                        picked = await insert_material(page, frame, b.type, b.raw)
+                    except EditorError as e:
+                        picked = None
+                        notes.append(f"{i}:글감 {b.type} 넣기 오류({e})")
+                    await _focus_tail(page, frame)
+                    # 미리 찾아둔 카드라 여기서 못 찾는 일은 드물다. 대신 글자를 치면 커서가
+                    # 엉뚱한 곳에 있어 순서가 뒤섞이므로 치지 않고 기록만 남긴다.
+                    notes.append(f"{i}:글감 {b.type}({picked[:30]})" if picked
+                                 else f"{i}:글감 {b.type} 누락({b.raw[:30]})")
                 elif b.type == "place":
                     picked = await insert_place(page, frame, b.raw)
                     await _focus_tail(page, frame)
                     # 검색 결과 중 첫 번째를 쓰므로 무엇을 골랐는지 남긴다.
                     notes.append(f"{i}:장소({picked[:24]})")
+                elif b.type == "video":
+                    try:
+                        picked = await insert_video(page, frame, b.raw)
+                        notes.append(f"{i}:영상({picked[:30]})")
+                    except EditorError as e:
+                        notes.append(f"{i}:영상 누락({e})")
+                    await _focus_tail(page, frame)
                 else:
                     await _fresh_line(page, frame)
+                    await reset_style(page, frame)
                     await _type_block(page, frame, b)
                     notes.append(f"{i}:{b.type}(타이핑)")
             continue
 
+        await reset_style(page, frame)
         if prefer_paste:
             try:
                 before = await _doc_state(frame)
@@ -1000,13 +1471,18 @@ def _to_plain(html: str) -> str:
 
 
 async def _type_block(page: Page, frame: Frame, b: Block) -> None:
-    if b.type in ("image", "file", "divider", "formula", "place"):
+    if b.type in ("image", "file", "divider", "formula", "place", "video"):
         return  # 키보드로 만들 수 없다 (write_post 가 툴바로 처리)
+    if b.gap and b.type in ("heading", "paragraph"):
+        await page.keyboard.press("Enter")  # 앞에 빈 줄 하나
     if b.type == "heading":
         # 제목은 "글자 크기" 일 뿐이다. 먼저 내용을 치고(링크 포함),
         # 그 줄을 통째로 선택해서 크기를 준다. 그래야 제목과 링크를 둘 다 살린다.
-        await type_spans(page, frame, b.spans)
-        n = sum(caret_len(sp.text) for sp in b.spans)
+        # 굵게는 타이핑하면서 켰다 끈다. 선택 구간에 굵게를 주면 토글이 켜진 채 남는다.
+        spans = [Span(sp.text, bold=True, italic=sp.italic, underline=sp.underline,
+                      strike=sp.strike, code=sp.code, href=sp.href) for sp in b.spans]
+        await type_spans(page, frame, spans)
+        n = sum(caret_len(sp.text) for sp in spans)
         size = S.HEADING_SIZE.get(b.level, S.BODY_SIZE)
         if n and size != S.BODY_SIZE:
             for _ in range(n):
